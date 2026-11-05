@@ -1,49 +1,103 @@
+"""
+Complete End-to-End Pipeline for Malayalam Handwritten Character Recognition:
+  Step 1: Image loading & PyTorch standardization
+  Step 2: ConvNeXt-Tiny deep visual representation extraction (768-D)
+  Step 3: PCA orthogonal dimensionality reduction (768-D -> 64/150-D)
+  Step 4: Random Forest multi-class ensemble classification
+"""
+
+import time
+from typing import Dict, Any, Optional, Union
 import numpy as np
-from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestClassifier
+from PIL import Image
+import torch
 
-MALAYALAM_CHARS = {
-    0: ("അ", "a"),
-    1: ("ആ", "aa"),
-    2: ("ഇ", "i"),
-    3: ("ഈ", "ii"),
-    4: ("ഉ", "u"),
-    5: ("ക", "ka"),
-    6: ("ഖ", "kha"),
-    7: ("ഗ", "ga")
-}
+from .dataset import MALAYALAM_CLASSES, get_transforms
+from .convnext_extractor import ConvNeXtFeatureExtractor
+from .pca_reduction import FeatureCompressorPCA
+from .rf_classifier import MalayalamRFClassifier
 
-class ConvNeXtPCARandomForest:
+class MalayalamRecognitionPipeline:
     """
-    Hybrid handwriting recognition architecture:
-      1. ConvNeXt-Tiny Deep Feature Representation (768 dimensions)
-      2. PCA Orthogonal Dimensionality Reduction (768 -> 64 components)
-      3. Random Forest Multi-class Classifier
+    End-to-end hybrid architecture uniting ConvNeXt-Tiny, PCA compression, and Random Forest ensemble.
     """
-    def __init__(self, n_components: int = 64, n_estimators: int = 150):
-        self.pca = PCA(n_components=n_components, random_state=42)
-        self.rf = RandomForestClassifier(n_estimators=n_estimators, random_state=42, n_jobs=-1)
-        self._init_mock_model()
+    def __init__(
+        self,
+        pca_components: int = 64,
+        rf_estimators: int = 150,
+        checkpoint_path: Optional[str] = None,
+        device: Optional[str] = None
+    ):
+        self.pca_components = pca_components
+        self.rf_estimators = rf_estimators
+        self.train_transform, self.eval_transform = get_transforms(img_size=224)
 
-    def _init_mock_model(self):
-        np.random.seed(42)
-        # Generate 200 samples with 64 dimensions for robust PCA fitting
-        X_feats = np.random.randn(200, 768)
-        # Normalize features
-        X_feats = (X_feats - np.mean(X_feats, axis=0)) / (np.std(X_feats, axis=0) + 1e-6)
-        y = np.random.randint(0, len(MALAYALAM_CHARS), size=200)
-        X_pca = self.pca.fit_transform(X_feats)
-        self.rf.fit(X_pca, y)
+        self.extractor = ConvNeXtFeatureExtractor(checkpoint_path=checkpoint_path, device=device)
+        self.compressor = FeatureCompressorPCA(n_components=pca_components, use_scaling=True)
+        self.classifier = MalayalamRFClassifier(n_estimators=rf_estimators, max_depth=15)
 
-    def predict(self, convnext_feature_vector: np.ndarray) -> dict:
-        pca_vec = self.pca.transform(convnext_feature_vector.reshape(1, -1))
-        pred_idx = self.rf.predict(pca_vec)[0]
-        probs = self.rf.predict_proba(pca_vec)[0]
-        glyph, phonetic = MALAYALAM_CHARS[pred_idx]
+    def train_pipeline(self, train_features: np.ndarray, train_labels: np.ndarray) -> Dict[str, Any]:
+        """
+        Fits PCA dimensionality reduction and trains Random Forest classifier on ConvNeXt representations.
+        """
+        print(f"[*] Fitting PCA compressor: {train_features.shape[1]} -> {self.pca_components} components...")
+        t0 = time.perf_counter()
+        X_pca = self.compressor.fit_transform(train_features)
+        pca_fit_ms = (time.perf_counter() - t0) * 1000.0
+
+        print(f"[*] Training Random Forest on compressed features ({X_pca.shape})...")
+        rf_train_ms = self.classifier.fit(X_pca, train_labels)
 
         return {
+            "pca_components": self.pca_components,
+            "variance_explained": round(self.compressor.cumulative_variance_ratio * 100, 2),
+            "pca_time_ms": round(pca_fit_ms, 2),
+            "rf_train_time_ms": round(rf_train_ms, 2)
+        }
+
+    def predict_image(self, image_or_path: Union[str, Image.Image]) -> Dict[str, Any]:
+        """
+        Full inference from raw image input to Malayalam character identification.
+        """
+        t_start = time.perf_counter()
+
+        # Step 1: Preprocess image
+        if isinstance(image_or_path, str):
+            image = Image.open(image_or_path).convert("RGB")
+        else:
+            image = image_or_path.convert("RGB")
+
+        tensor = self.eval_transform(image)
+
+        # Step 2: ConvNeXt feature extraction (768-D)
+        t_fe = time.perf_counter()
+        feat_768 = self.extractor.extract_from_tensor(tensor)
+        fe_time_ms = (time.perf_counter() - t_fe) * 1000.0
+
+        # Step 3: PCA compression
+        t_pca = time.perf_counter()
+        feat_reduced = self.compressor.transform(feat_768)
+        pca_time_ms = (time.perf_counter() - t_pca) * 1000.0
+
+        # Step 4: Random Forest prediction
+        t_rf = time.perf_counter()
+        pred_idx, conf = self.classifier.predict_single(feat_reduced)
+        rf_time_ms = (time.perf_counter() - t_rf) * 1000.0
+
+        total_latency_ms = (time.perf_counter() - t_start) * 1000.0
+        glyph, phonetic = MALAYALAM_CLASSES.get(pred_idx, ("?", f"class_{pred_idx}"))
+
+        return {
+            "predicted_class_id": pred_idx,
             "glyph": glyph,
             "phonetic": phonetic,
-            "confidence": round(float(probs[pred_idx]), 4),
-            "reduced_dim": pca_vec.shape[1]
+            "confidence": round(conf, 4),
+            "input_dimension": 768,
+            "reduced_dimension": feat_reduced.shape[1],
+            "latency_breakdown_ms": {
+                "feature_extraction": round(fe_time_ms, 2),
+                "pca_projection": round(pca_time_ms, 2),
+                "rf_inference": round(rf_time_ms, 2),
+                "total": round(total_latency_ms, 2)
+            }
         }
