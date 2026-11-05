@@ -72,3 +72,4 @@ class ConvNeXtFeatureExtractor:
             all_labels.append(labels.numpy())
 
         return np.vstack(all_features), np.hstack(all_labels)
+

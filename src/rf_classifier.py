@@ -61,3 +61,4 @@ class MalayalamRFClassifier:
         probs = self.clf.predict_proba(feature_vector)[0]
         confidence = float(probs[pred_idx])
         return pred_idx, confidence
+
