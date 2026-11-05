@@ -27,8 +27,11 @@ class ConvNeXtPCARandomForest:
 
     def _init_mock_model(self):
         np.random.seed(42)
-        X_feats = np.random.randn(120, 768)
-        y = np.random.randint(0, len(MALAYALAM_CHARS), size=120)
+        # Generate 200 samples with 64 dimensions for robust PCA fitting
+        X_feats = np.random.randn(200, 768)
+        # Normalize features
+        X_feats = (X_feats - np.mean(X_feats, axis=0)) / (np.std(X_feats, axis=0) + 1e-6)
+        y = np.random.randint(0, len(MALAYALAM_CHARS), size=200)
         X_pca = self.pca.fit_transform(X_feats)
         self.rf.fit(X_pca, y)
 
